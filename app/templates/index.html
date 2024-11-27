@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Video Editor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        async function downloadVideo() {
+            const url = document.getElementById("videoUrl").value;
+            const loadingEl = document.getElementById("loadingState");
+            const errorEl = document.getElementById("errorState");
+            
+            try {
+                loadingEl.classList.remove("hidden");
+                errorEl.classList.add("hidden");
+
+                const response = await fetch("/download", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ url })
+                });
+
+                const result = await response.json();
+                if (response.ok) {
+                    document.getElementById("filePath").value = result.absolute_path;
+                    const videoPreview = document.getElementById("videoPreview");
+                    videoPreview.src = result.file_path;
+                    videoPreview.load(); // Força o recarregamento do vídeo
+                    document.getElementById("editingSection").classList.remove("hidden");
+                } else {
+                    throw new Error(result.error);
+                }
+            } catch (error) {
+                errorEl.textContent = `Failed to download video: ${error.message}`;
+                errorEl.classList.remove("hidden");
+            } finally {
+                loadingEl.classList.add("hidden");
+            }
+        }
+
+        async function clipVideo() {
+            const file_path = document.getElementById("filePath").value;
+            const start_time = document.getElementById("startTime").value;
+            const end_time = document.getElementById("endTime").value;
+            const loadingEl = document.getElementById("loadingState");
+            const errorEl = document.getElementById("errorState");
+
+            try {
+                loadingEl.classList.remove("hidden");
+                errorEl.classList.add("hidden");
+
+                const response = await fetch("/clip", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({ file_path, start_time, end_time })
+                });
+
+                const result = await response.json();
+                if (response.ok) {
+                    // Criar elemento para mostrar o clip
+                    const clipElement = document.createElement("div");
+                    clipElement.className = "mt-8 p-4 bg-gray-50 rounded-lg shadow";
+                    clipElement.innerHTML = `
+                        <h4 class="text-lg font-semibold mb-2">Clipped Video</h4>
+                        <video controls class="w-full rounded-lg shadow-md mb-4">
+                            <source src="${result.clip_path}" type="video/mp4">
+                        </video>
+                        <div class="flex justify-end">
+                            <a href="${result.clip_path}" 
+                               download="clipped_video.mp4" 
+                               class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
+                                Download Clip
+                            </a>
+                        </div>
+                    `;
+
+                    // Adicionar o clip ao container
+                    const clipsContainer = document.getElementById("clipsContainer");
+                    clipsContainer.appendChild(clipElement);
+                } else {
+                    throw new Error(result.error);
+                }
+            } catch (error) {
+                errorEl.textContent = `Failed to clip video: ${error.message}`;
+                errorEl.classList.remove("hidden");
+            } finally {
+                loadingEl.classList.add("hidden");
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-100 min-h-screen p-8">
+    <div class="max-w-3xl mx-auto bg-white rounded-lg shadow-md p-6">
+        <h1 class="text-3xl font-bold mb-8 text-center text-blue-600">YouTube Video Editor</h1>
+
+        <!-- URL Input Section -->
+        <div class="mb-8">
+            <label for="videoUrl" class="block text-sm font-medium text-gray-700 mb-2">YouTube Video URL:</label>
+            <div class="flex gap-2">
+                <input type="text" id="videoUrl" 
+                    class="flex-1 rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                    placeholder="https://www.youtube.com/watch?v=...">
+                <button onclick="downloadVideo()" 
+                    class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors">
+                    Load Video
+                </button>
+            </div>
+        </div>
+
+        <!-- Loading & Error States -->
+        <div id="loadingState" class="hidden text-center py-4">
+            <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
+            <p class="mt-2 text-gray-600">Processing...</p>
+        </div>
+        <div id="errorState" class="hidden text-red-600 py-4 text-center"></div>
+
+        <!-- Editing Section -->
+        <div id="editingSection" class="hidden">
+            <h3 class="text-xl font-semibold mb-4 text-gray-800">Clipping Options</h3>
+            
+            <!-- Video Preview -->
+            <div class="mb-4">
+                <video id="videoPreview" controls class="w-full rounded-lg shadow-md"></video>
+            </div>
+
+            <input type="hidden" id="filePath">
+            
+            <div class="grid grid-cols-2 gap-4 mb-4">
+                <div>
+                    <label for="startTime" class="block text-sm font-medium text-gray-700 mb-2">Start Time (seconds):</label>
+                    <input type="number" id="startTime" 
+                        class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                        placeholder="e.g., 10">
+                </div>
+                <div>
+                    <label for="endTime" class="block text-sm font-medium text-gray-700 mb-2">End Time (seconds):</label>
+                    <input type="number" id="endTime" 
+                        class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                        placeholder="e.g., 30">
+                </div>
+            </div>
+
+            <button onclick="clipVideo()" 
+                class="w-full bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
+                Create Clip
+            </button>
+
+            <!-- Container for Clips -->
+            <div id="clipsContainer" class="mt-8">
+                <!-- Clips will be added here dynamically -->
+            </div>
+        </div>
+    </div>
+</body>
+</html>

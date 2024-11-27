@@ -1,0 +1,2 @@
+class PytubeError(Exception):
+    pass 

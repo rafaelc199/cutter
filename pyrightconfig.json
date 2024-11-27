@@ -1,0 +1,22 @@
+{
+    "include": [
+        "app"
+    ],
+    "exclude": [
+        "**/node_modules",
+        "**/__pycache__",
+        "**/.*"
+    ],
+    "reportMissingImports": "warning",
+    "reportMissingTypeStubs": "warning",
+    "pythonVersion": "3.8",
+    "pythonPlatform": "All",
+    "venvPath": ".",
+    "venv": "venv",
+    "stubPath": "app/stubs",
+    "typeCheckingMode": "basic",
+    "extraPaths": [
+        "app/stubs"
+    ],
+    "useLibraryCodeForTypes": true
+} 

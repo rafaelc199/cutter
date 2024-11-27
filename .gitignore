@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+
+# Diretórios de mídia
+app/downloads/*
+app/clips/*
+!app/downloads/.gitkeep
+!app/clips/.gitkeep
+
+# Ambiente
+.env
+.venv
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Sistema
+.DS_Store
+Thumbs.db 
