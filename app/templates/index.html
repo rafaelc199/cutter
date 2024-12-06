@@ -28,7 +28,7 @@
                     document.getElementById("filePath").value = result.absolute_path;
                     const videoPreview = document.getElementById("videoPreview");
                     videoPreview.src = result.file_path;
-                    videoPreview.load(); // Força o recarregamento do vídeo
+                    videoPreview.load();
                     document.getElementById("editingSection").classList.remove("hidden");
                 } else {
                     throw new Error(result.error);
@@ -41,55 +41,156 @@
             }
         }
 
-        async function clipVideo() {
+        function addNewCut() {
+            const cutEntry = document.createElement('div');
+            cutEntry.className = 'cut-entry bg-gray-50 p-4 rounded-lg';
+            cutEntry.innerHTML = `
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">Start Time (seconds):</label>
+                        <input type="number" 
+                            class="start-time w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                            placeholder="e.g., 10">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700 mb-2">End Time (seconds):</label>
+                        <input type="number" 
+                            class="end-time w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                            placeholder="e.g., 30">
+                    </div>
+                </div>
+                <button onclick="this.parentElement.remove()" 
+                    class="mt-2 text-red-600 hover:text-red-800 text-sm">
+                    Remove Cut
+                </button>
+            `;
+            document.getElementById('cutsList').appendChild(cutEntry);
+        }
+
+        async function generateAllClips() {
             const file_path = document.getElementById("filePath").value;
-            const start_time = document.getElementById("startTime").value;
-            const end_time = document.getElementById("endTime").value;
             const loadingEl = document.getElementById("loadingState");
             const errorEl = document.getElementById("errorState");
+            
+            const cuts = Array.from(document.getElementsByClassName('cut-entry')).map(entry => ({
+                start_time: entry.querySelector('.start-time').value,
+                end_time: entry.querySelector('.end-time').value
+            }));
 
             try {
                 loadingEl.classList.remove("hidden");
                 errorEl.classList.add("hidden");
 
-                const response = await fetch("/clip", {
+                const response = await fetch("/clip-multiple", {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json"
                     },
-                    body: JSON.stringify({ file_path, start_time, end_time })
+                    body: JSON.stringify({ file_path, cuts })
                 });
 
-                const result = await response.json();
+                const results = await response.json();
                 if (response.ok) {
-                    // Criar elemento para mostrar o clip
-                    const clipElement = document.createElement("div");
-                    clipElement.className = "mt-8 p-4 bg-gray-50 rounded-lg shadow";
-                    clipElement.innerHTML = `
-                        <h4 class="text-lg font-semibold mb-2">Clipped Video</h4>
-                        <video controls class="w-full rounded-lg shadow-md mb-4">
-                            <source src="${result.clip_path}" type="video/mp4">
-                        </video>
-                        <div class="flex justify-end">
-                            <a href="${result.clip_path}" 
-                               download="clipped_video.mp4" 
-                               class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
-                                Download Clip
-                            </a>
-                        </div>
-                    `;
+                    results.clips.forEach((clip, index) => {
+                        const clipElement = document.createElement("div");
+                        clipElement.className = "mt-8 p-4 bg-gray-50 rounded-lg shadow";
+                        clipElement.innerHTML = `
+                            <h4 class="text-lg font-semibold mb-2">
+                                Clip ${index + 1} (${clip.start_time}s - ${clip.end_time}s)
+                            </h4>
+                            <video controls class="w-full rounded-lg shadow-md mb-4">
+                                <source src="${clip.clip_path}" type="video/mp4" />
+                            </video>
+                            <div class="flex items-center gap-2">
+                                <input type="text" 
+                                    placeholder="Enter clip name (or leave empty for auto-naming)" 
+                                    class="rounded-md border-gray-300 shadow-sm px-3 py-2 focus:border-blue-500 focus:ring-blue-500 flex-grow" 
+                                    id="clipName-${clip.clip_path}">
+                                <button onclick="downloadClip('${clip.clip_path}', 'clipName-${clip.clip_path}')"
+                                    class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
+                                    Download
+                                </button>
+                            </div>
+                        `;
+                        document.getElementById("clipsContainer").appendChild(clipElement);
+                    });
 
-                    // Adicionar o clip ao container
-                    const clipsContainer = document.getElementById("clipsContainer");
-                    clipsContainer.appendChild(clipElement);
+                    const bulkDownloadButton = document.createElement("div");
+                    bulkDownloadButton.className = "mt-8 text-center";
+                    bulkDownloadButton.innerHTML = `
+                        <button onclick="downloadAllClips()"
+                            class="bg-blue-600 text-white px-6 py-3 rounded-md hover:bg-blue-700 transition-colors">
+                            Download All Clips
+                        </button>
+                    `;
+                    document.getElementById("clipsContainer").insertBefore(
+                        bulkDownloadButton,
+                        document.getElementById("clipsContainer").firstChild
+                    );
                 } else {
-                    throw new Error(result.error);
+                    throw new Error(results.error);
                 }
             } catch (error) {
-                errorEl.textContent = `Failed to clip video: ${error.message}`;
+                errorEl.textContent = `Failed to generate clips: ${error.message}`;
                 errorEl.classList.remove("hidden");
             } finally {
                 loadingEl.classList.add("hidden");
+            }
+        }
+
+        async function downloadClip(clipPath, inputId) {
+            try {
+                const clipName = document.getElementById(inputId).value.trim() || "clip";
+                const oldName = clipPath.split('/').pop();
+                
+                const response = await fetch("/rename-clip", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        old_name: oldName,
+                        new_name: clipName
+                    })
+                });
+                
+                const result = await response.json();
+                if (!response.ok) {
+                    throw new Error(result.error);
+                }
+                
+                const a = document.createElement("a");
+                a.href = result.new_path;
+                a.download = `${clipName}.mp4`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                
+            } catch (error) {
+                alert(`Error renaming file: ${error.message}`);
+            }
+        }
+
+        async function downloadAllClips() {
+            const clips = document.querySelectorAll('#clipsContainer .mt-8.p-4');
+            let delay = 0;
+            
+            for (const clip of clips) {
+                const inputElement = clip.querySelector('input');
+                const buttonElement = clip.querySelector('button');
+                
+                if (inputElement && buttonElement) {
+                    if (!inputElement.value.trim()) {
+                        const index = Array.from(clips).indexOf(clip) + 1;
+                        inputElement.value = `clip_${index}`;
+                    }
+                    
+                    setTimeout(() => {
+                        buttonElement.click();
+                    }, delay);
+                    
+                    delay += 1000;
+                }
             }
         }
     </script>
@@ -98,7 +199,6 @@
     <div class="max-w-3xl mx-auto bg-white rounded-lg shadow-md p-6">
         <h1 class="text-3xl font-bold mb-8 text-center text-blue-600">YouTube Video Editor</h1>
 
-        <!-- URL Input Section -->
         <div class="mb-8">
             <label for="videoUrl" class="block text-sm font-medium text-gray-700 mb-2">YouTube Video URL:</label>
             <div class="flex gap-2">
@@ -112,45 +212,51 @@
             </div>
         </div>
 
-        <!-- Loading & Error States -->
         <div id="loadingState" class="hidden text-center py-4">
             <div class="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
             <p class="mt-2 text-gray-600">Processing...</p>
         </div>
         <div id="errorState" class="hidden text-red-600 py-4 text-center"></div>
 
-        <!-- Editing Section -->
         <div id="editingSection" class="hidden">
             <h3 class="text-xl font-semibold mb-4 text-gray-800">Clipping Options</h3>
             
-            <!-- Video Preview -->
             <div class="mb-4">
                 <video id="videoPreview" controls class="w-full rounded-lg shadow-md"></video>
             </div>
 
             <input type="hidden" id="filePath">
             
-            <div class="grid grid-cols-2 gap-4 mb-4">
-                <div>
-                    <label for="startTime" class="block text-sm font-medium text-gray-700 mb-2">Start Time (seconds):</label>
-                    <input type="number" id="startTime" 
-                        class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
-                        placeholder="e.g., 10">
-                </div>
-                <div>
-                    <label for="endTime" class="block text-sm font-medium text-gray-700 mb-2">End Time (seconds):</label>
-                    <input type="number" id="endTime" 
-                        class="w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
-                        placeholder="e.g., 30">
+            <div id="cutsList" class="space-y-4 mb-4">
+                <div class="cut-entry bg-gray-50 p-4 rounded-lg">
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">Start Time (seconds):</label>
+                            <input type="number" 
+                                class="start-time w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                                placeholder="e.g., 10">
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-2">End Time (seconds):</label>
+                            <input type="number" 
+                                class="end-time w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500"
+                                placeholder="e.g., 30">
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <button onclick="clipVideo()" 
-                class="w-full bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors">
-                Create Clip
-            </button>
+            <div class="flex gap-4 mb-6">
+                <button onclick="addNewCut()" 
+                    class="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 transition-colors">
+                    Add Another Cut
+                </button>
+                <button onclick="generateAllClips()" 
+                    class="bg-green-600 text-white px-4 py-2 rounded-md hover:bg-green-700 transition-colors flex-grow">
+                    Generate All Clips
+                </button>
+            </div>
 
-            <!-- Container for Clips -->
             <div id="clipsContainer" class="mt-8">
                 <!-- Clips will be added here dynamically -->
             </div>

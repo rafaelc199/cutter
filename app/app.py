@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory
 import yt_dlp
 import os
-import sys
 import uuid
 import time
 import re
@@ -9,7 +8,7 @@ import re
 # Initialize Flask app
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024 * 1024  # 16GB max-size
-app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # Desabilitar cache
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
 # Create base directory paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -19,26 +18,21 @@ CLIP_DIR = os.path.join(BASE_DIR, "clips")
 # Create necessary directories
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(CLIP_DIR, exist_ok=True)
-
-# Após criar os diretórios
 os.chmod(DOWNLOAD_DIR, 0o755)
 os.chmod(CLIP_DIR, 0o755)
 
-# Route to serve the front-end
 @app.route("/")
 def home():
-    return render_template("index.html")  # Flask will look for this in templates/
+    return render_template("index.html")
 
-# Adicionar rota para servir os vídeos baixados
 @app.route('/downloads/<path:filename>')
 def download_file(filename):
     try:
-        # Usar send_from_directory com o caminho absoluto
         return send_from_directory(
             DOWNLOAD_DIR, 
             filename,
-            as_attachment=False,  # Para reproduzir no navegador
-            mimetype='video/mp4'  # Definir explicitamente o tipo MIME
+            as_attachment=False,
+            mimetype='video/mp4'
         )
     except Exception as e:
         app.logger.error(f"Error serving video file: {str(e)}")
@@ -47,31 +41,25 @@ def download_file(filename):
 @app.route('/clips/<path:filename>')
 def serve_clip(filename):
     try:
-        # Usar send_from_directory com o caminho absoluto e configurações corretas
         response = send_from_directory(
             CLIP_DIR,
             filename,
             as_attachment=False,
             mimetype='video/mp4',
-            conditional=True  # Habilita suporte a streaming
+            conditional=True
         )
-        
-        # Adicionar headers necessários para streaming de vídeo
         response.headers['Accept-Ranges'] = 'bytes'
         response.headers['Cache-Control'] = 'no-cache'
         return response
-        
     except Exception as e:
         app.logger.error(f"Error serving clip file: {str(e)}")
         return jsonify({"error": "File not found"}), 404
 
 def extract_video_id(url):
-    """Extract video ID from YouTube URL"""
     patterns = [
         r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
         r'youtu\.be\/([0-9A-Za-z_-]{11})',
     ]
-    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
@@ -79,17 +67,14 @@ def extract_video_id(url):
     return None
 
 def download_video_ytdlp(url):
-    """Downloads YouTube video using yt-dlp with improved configuration"""
     try:
-        # Generate unique filename
         filename = f"{uuid.uuid4()}.mp4"
         output_path = os.path.join(DOWNLOAD_DIR, filename)
         
-        # Configure yt-dlp options
         ydl_opts = {
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]',  # Modificada a ordem dos formatos
+            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]',
             'outtmpl': output_path,
-            'quiet': True,  # Reduzir logs
+            'quiet': True,
             'no_warnings': True,
             'nocheckcertificate': True,
             'ignoreerrors': True,
@@ -109,32 +94,25 @@ def download_video_ytdlp(url):
             }],
         }
         
-        # Download the video
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    raise Exception("Could not extract video information")
-                
-                # Verificar se o arquivo foi criado
-                if not os.path.exists(output_path):
-                    raise Exception("Video file was not created")
-                
-                return {
-                    "file_path": f"/downloads/{filename}",  # URL relativa para o frontend
-                    "absolute_path": output_path,  # Caminho absoluto para uso interno
-                    "title": info.get('title', 'Unknown Title'),
-                    "duration": info.get('duration', 0),
-                    "channel": info.get('uploader', 'Unknown Channel')
-                }
-            except Exception as download_error:
-                print(f"Download error: {str(download_error)}")
-                raise Exception(f"Download process failed: {str(download_error)}")
+            info = ydl.extract_info(url, download=True)
+            if not info:
+                raise Exception("Could not extract video information")
+            
+            if not os.path.exists(output_path):
+                raise Exception("Video file was not created")
+            
+            return {
+                "file_path": f"/downloads/{filename}",
+                "absolute_path": output_path,
+                "title": info.get('title', 'Unknown Title'),
+                "duration": info.get('duration', 0),
+                "channel": info.get('uploader', 'Unknown Channel')
+            }
             
     except Exception as e:
-        error_msg = str(e)
-        print(f"Error in download_video_ytdlp: {error_msg}")
-        raise Exception(f"Download failed: {error_msg}")
+        print(f"Error in download_video_ytdlp: {str(e)}")
+        raise Exception(f"Download failed: {str(e)}")
 
 @app.route("/download", methods=["POST"])
 def download_video():
@@ -157,8 +135,8 @@ def download_video():
         
         return jsonify({
             "message": "Video downloaded successfully",
-            "file_path": result["file_path"],  # URL relativa para o frontend
-            "absolute_path": result["absolute_path"],  # Caminho absoluto para uso interno
+            "file_path": result["file_path"],
+            "absolute_path": result["absolute_path"],
             "title": result["title"],
             "duration": result["duration"],
             "channel": result["channel"]
@@ -175,76 +153,100 @@ def download_video():
         else:
             return jsonify({"error": f"Download failed: {error_msg}"}), 500
 
-@app.route("/clip", methods=["POST"])
-def clip_video():
+@app.route("/clip-multiple", methods=["POST"])
+def clip_multiple():
     try:
         from moviepy.editor import VideoFileClip
         
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
-            
-        data = request.get_json()
-        video_path = data.get("file_path")
-        start_time = data.get("start_time")
-        end_time = data.get("end_time")
-
-        if not all([video_path, start_time is not None, end_time is not None]):
-            return jsonify({"error": "Missing required parameters"}), 400
-
-        # Converter o caminho relativo para absoluto
-        if video_path.startswith('/downloads/'):
-            video_path = os.path.join(DOWNLOAD_DIR, os.path.basename(video_path))
-
-        try:
-            start_time = float(start_time)
-            end_time = float(end_time)
-        except ValueError:
-            return jsonify({"error": "Invalid time format"}), 400
+        data = request.json
+        file_path = data["file_path"]
+        cuts = data["cuts"]
         
-        if start_time < 0 or end_time <= start_time:
-            return jsonify({"error": "Invalid time values"}), 400
-
-        if not os.path.exists(video_path):
+        if file_path.startswith('/downloads/'):
+            file_path = os.path.join(DOWNLOAD_DIR, os.path.basename(file_path))
+        
+        if not os.path.exists(file_path):
             return jsonify({"error": "Video file not found"}), 404
-
-        clip_filename = f"clip_{uuid.uuid4()}.mp4"
-        clip_output_path = os.path.join(CLIP_DIR, clip_filename)
-
-        with VideoFileClip(video_path) as video:
+        
+        clips = []
+        for cut in cuts:
+            start_time = float(cut["start_time"])
+            end_time = float(cut["end_time"])
+            
+            temp_filename = f"temp_{uuid.uuid4()}.mp4"
+            clip_path = os.path.join(CLIP_DIR, temp_filename)
+            
+            video = VideoFileClip(file_path)
+            
             if end_time > video.duration:
-                return jsonify({"error": "End time exceeds video duration"}), 400
-                
+                video.close()
+                return jsonify({"error": f"End time {end_time} exceeds video duration {video.duration}"}), 400
+            if start_time < 0 or end_time <= start_time:
+                video.close()
+                return jsonify({"error": "Invalid time values"}), 400
+            
             clip = video.subclip(start_time, end_time)
             clip.write_videofile(
-                clip_output_path,
+                clip_path,
                 codec="libx264",
                 audio_codec="aac",
-                temp_audiofile=os.path.join(CLIP_DIR, "temp-audio.m4a"),
+                temp_audiofile=os.path.join(CLIP_DIR, f"temp-audio-{uuid.uuid4()}.m4a"),
                 remove_temp=True,
-                threads=4,  # Usar múltiplas threads para melhor performance
-                preset='ultrafast'  # Codificação mais rápida
+                threads=4,
+                preset='ultrafast'
             )
+            clip.close()
+            video.close()
             
-        # Garantir que o arquivo tem as permissões corretas
-        os.chmod(clip_output_path, 0o644)
-
-        # Verificar se o arquivo foi criado e é acessível
-        if not os.path.exists(clip_output_path):
-            raise Exception("Failed to create clip file")
-
-        return jsonify({
-            "message": "Video clipped successfully",
-            "clip_path": f"/clips/{clip_filename}"  # URL relativa para o frontend
-        })
-
-    except ModuleNotFoundError:
-        return jsonify({"error": "Required video processing module not found. Please install moviepy."}), 500
+            os.chmod(clip_path, 0o644)
+            
+            clips.append({
+                "start_time": start_time,
+                "end_time": end_time,
+                "clip_path": f"/clips/{temp_filename}"
+            })
+        
+        return jsonify({"clips": clips})
+    
     except Exception as e:
-        return jsonify({"error": f"Failed to create clip: {str(e)}"}), 500
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/rename-clip", methods=["POST"])
+def rename_clip():
+    try:
+        data = request.json
+        old_name = data["old_name"]
+        new_name = data["new_name"]
+        
+        new_name = "".join(c for c in new_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        if not new_name:
+            new_name = "clip"
+        
+        old_path = os.path.join(CLIP_DIR, old_name)
+        base_new_path = os.path.join(CLIP_DIR, f"{new_name}.mp4")
+        
+        if not os.path.exists(old_path):
+            return jsonify({"error": "File not found"}), 404
+        
+        counter = 1
+        new_path = base_new_path
+        while os.path.exists(new_path):
+            new_path = os.path.join(CLIP_DIR, f"{new_name}_{counter}.mp4")
+            counter += 1
+        
+        os.rename(old_path, new_path)
+        new_filename = os.path.basename(new_path)
+        
+        return jsonify({
+            "success": True,
+            "new_path": f"/clips/{new_filename}"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/cleanup", methods=["POST"])
 def cleanup_files():
-    """Remove files older than 24 hours"""
     try:
         current_time = time.time()
         deleted_files = []

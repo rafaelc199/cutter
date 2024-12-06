@@ -1,21 +1,16 @@
 # YouTube Video Editor
 
-Uma aplicação web que permite baixar vídeos do YouTube e criar clips personalizados.
+A simple web application for downloading and editing YouTube videos.
 
-## Funcionalidades
+## Features
 
-- Download de vídeos do YouTube
-- Preview do vídeo baixado
-- Criação de clips com tempos de início e fim personalizados
-- Download dos clips gerados
-- Interface intuitiva e responsiva
+- Download YouTube videos
+- Create multiple clips from a video by specifying start and end times
+- Preview clips before downloading
+- Custom naming for downloaded clips
+- Bulk download of all generated clips
+- Automatic file cleanup after 24 hours
 
-## Requisitos
+## Setup
 
-- Python 3.8 ou superior
-- FFmpeg instalado no sistema
-- Pip (gerenciador de pacotes Python)
-
-## Instalação
-
-1. Clone o repositório: 
+1. Install dependencies:
