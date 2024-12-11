@@ -1,16 +1,23 @@
-# YouTube Video Editor
+# Video Editor Application
 
-A simple web application for downloading and editing YouTube videos.
+Uma aplicação web para edição de vídeos usando FFmpeg e MoviePy, com interface construída em TailwindCSS.
 
-## Features
+## Funcionalidades
 
-- Download YouTube videos
-- Create multiple clips from a video by specifying start and end times
-- Preview clips before downloading
-- Custom naming for downloaded clips
-- Bulk download of all generated clips
-- Automatic file cleanup after 24 hours
+- Processamento de vídeos usando FFmpeg
+- Interface responsiva com TailwindCSS
+- Suporte para redimensionamento de vídeos
+- Recorte de vídeos com tempos específicos
+- Aplicação de filtros
 
-## Setup
+## Requisitos
 
-1. Install dependencies:
+- Python 3.8+
+- FFmpeg
+- MoviePy
+- Flask
+- TailwindCSS
+
+## Instalação
+
+1. Clone o repositório:
