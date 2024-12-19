@@ -5,6 +5,9 @@ import os
 import subprocess
 import zipfile
 from typing import Optional, Any, cast, Dict
+from werkzeug.utils import secure_filename
+from datetime import datetime, timedelta
+import shutil
 
 # Third-party imports
 from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_file, send_from_directory
@@ -30,6 +33,9 @@ app.static_folder = 'static'
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///app.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_EXTENSIONS'] = ['.mp4', '.avi', '.mov']
+app.config['FILE_CLEANUP_AGE'] = timedelta(hours=24)
 
 # Initialize extensions
 db.init_app(app)
@@ -92,15 +98,77 @@ def index():
     """Home page."""
     return render_template('index.html')
 
+def cleanup_old_files():
+    """Remove files older than FILE_CLEANUP_AGE"""
+    try:
+        cutoff = datetime.now() - app.config['FILE_CLEANUP_AGE']
+        
+        # Cleanup downloads
+        downloads_dir = os.path.join(app.root_path, 'downloads')
+        processed_dir = os.path.join(app.root_path, 'static', 'processed')
+        
+        for directory in [downloads_dir, processed_dir]:
+            if os.path.exists(directory):
+                for user_dir in os.listdir(directory):
+                    user_path = os.path.join(directory, user_dir)
+                    if os.path.isdir(user_path):
+                        for filename in os.listdir(user_path):
+                            filepath = os.path.join(user_path, filename)
+                            file_time = datetime.fromtimestamp(os.path.getmtime(filepath))
+                            if file_time < cutoff:
+                                if os.path.isfile(filepath):
+                                    os.remove(filepath)
+                                elif os.path.isdir(filepath):
+                                    shutil.rmtree(filepath)
+        
+    except Exception as e:
+        logger.error(f"Error cleaning up files: {e}")
+
+def cleanup_user_files(user_id: int, video_path: Optional[str] = None):
+    """Clean up user's processed files.
+    
+    Args:
+        user_id: The user's ID
+        video_path: Optional specific video path to clean up related files
+    """
+    try:
+        processed_dir = os.path.join(app.root_path, 'static', 'processed', str(user_id))
+        if not os.path.exists(processed_dir):
+            return
+            
+        video_basename = os.path.basename(video_path) if video_path else None
+        
+        for filename in os.listdir(processed_dir):
+            file_path = os.path.join(processed_dir, filename)
+            # Se video_basename for fornecido, remover apenas arquivos relacionados a este vídeo
+            if video_basename:
+                # Remover timestamp do nome do arquivo para comparação
+                cleaned_filename = '_'.join(filename.split('_')[2:]) if filename.count('_') >= 2 else filename
+                if video_basename not in cleaned_filename:
+                    continue
+                    
+            if os.path.isfile(file_path):
+                try:
+                    os.remove(file_path)
+                    logger.debug(f"Removed file: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Could not remove file {file_path}: {e}")
+    except Exception as e:
+        logger.error(f"Error in cleanup_user_files: {e}")
+
 @app.route('/process_video', methods=['POST'])
 @login_required
 def process_video():
-    """Process uploaded YouTube video.
+    """Process uploaded YouTube video."""
+    if not request.content_length:
+        flash('No content received')
+        return redirect(url_for('index'))
+        
+    if request.content_length > app.config['MAX_CONTENT_LENGTH']:
+        flash('File too large')
+        return redirect(url_for('index'))
     
-    Returns:
-        A redirect response to either the edit page or index with appropriate flash messages.
-    """
-    youtube_url = request.form.get('youtube_url', '')
+    youtube_url = request.form.get('youtube_url', '').strip()
     if not youtube_url:
         flash('Please provide a YouTube URL')
         return redirect(url_for('index'))
@@ -174,6 +242,8 @@ def process_video():
 @login_required
 def edit_video(video_path):
     """Video editing page."""
+    # Limpar apenas os arquivos relacionados ao vídeo atual
+    cleanup_user_files(current_user.id, video_path)
     return render_template('edit_video.html', video_path=video_path)
 
 @app.route('/api/edit-video', methods=['POST'])
@@ -226,9 +296,19 @@ def edit_video_api():
         output_dir = os.path.join('static', 'processed', str(current_user.id))
         os.makedirs(output_dir, exist_ok=True)
         
-        # Generate output filename
-        output_filename = f'edited_{os.path.basename(video_path)}'
+        # Gerar nome único para o arquivo de saída
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_filename = f'edited_{timestamp}_{os.path.basename(video_path)}'
         output_path = os.path.join(output_dir, output_filename)
+        
+        # Remover versões anteriores do mesmo vídeo
+        for old_file in os.listdir(output_dir):
+            if old_file.startswith('edited_') and old_file.endswith(os.path.basename(video_path)):
+                old_path = os.path.join(output_dir, old_file)
+                try:
+                    os.remove(old_path)
+                except Exception as e:
+                    logger.warning(f"Could not remove old file {old_path}: {e}")
         
         # Validate input video exists
         input_path = os.path.join(base_dir, 'downloads', video_path)
@@ -303,22 +383,17 @@ def edit_video_api():
 @app.route('/api/generate-clips', methods=['POST'])
 @login_required
 def generate_clips():
-    """Generate video clips based on user specifications.
-    
-    Returns:
-        JSON response with success status and generated clip URLs.
-        
-    Raises:
-        ValueError: If request data is invalid
-        FileNotFoundError: If input/output files are not found
-        RuntimeError: If FFmpeg processing fails
-    """
     try:
         data = cast(Dict[str, Any], request.get_json())
         logger.debug("Received data: %s", data)
         
         if not data:
             raise ValueError("No JSON data received")
+            
+        # Obter o video_path do request
+        video_path = str(data.get('videoPath', '')).strip()
+        if not video_path:
+            raise ValueError("Video path is required")
             
         clips = cast(list[Dict[str, Any]], data.get('clips', []))
         logger.debug("Clips data: %s", clips)
@@ -329,11 +404,18 @@ def generate_clips():
         base_dir = os.path.abspath(os.path.dirname(__file__))
         generated_clips: list[str] = []
         
+        # Usar o video_path específico em vez de procurar por qualquer arquivo MP4
+        input_video_path = os.path.join(base_dir, 'downloads', video_path)
+        if not os.path.exists(input_video_path):
+            raise FileNotFoundError(f"Input video not found: {input_video_path}")
+            
+        logger.debug("Input video path: %s", input_video_path)
+        
         for clip in clips:
             logger.debug("Processing clip: %s", clip)
             
             # Validate clip data
-            required_keys = ['videoPath', 'name', 'startTime', 'endTime']
+            required_keys = ['name', 'startTime', 'endTime']
             if not all(key in clip for key in required_keys):
                 raise ValueError(f"Missing required clip data. Required: {required_keys}. Received: {clip}")
             
@@ -361,36 +443,20 @@ def generate_clips():
                 logger.error("Error converting time format: %s", e)
                 raise ValueError(f"Invalid time format. Expected MM:SS, got start={clip.get('startTime')}, end={clip.get('endTime')}")
             
-            # Get the user's download directory
-            user_download_dir = os.path.join(base_dir, 'downloads', str(current_user.id))
-            if not os.path.exists(user_download_dir):
-                raise FileNotFoundError(f"User download directory not found: {user_download_dir}")
-            
-            # Get the video filename from the directory
-            video_files = [f for f in os.listdir(user_download_dir) if f.endswith('.mp4')]
-            if not video_files:
-                raise FileNotFoundError(f"No MP4 files found in {user_download_dir}")
-            
-            # Use the first MP4 file found (assuming it's the one we want)
-            video_filename = video_files[0]
-            input_video_path = os.path.join(user_download_dir, video_filename)
-            
-            logger.debug("Input video path: %s", input_video_path)
-            logger.debug("Video file exists: %s", os.path.exists(input_video_path))
-            
             # Create output directory if it doesn't exist
             output_dir = os.path.join(base_dir, 'static', 'processed', str(current_user.id))
             os.makedirs(output_dir, exist_ok=True)
             logger.debug("Output directory: %s", output_dir)
             
-            # Generate output filename
-            clip_name = str(clip.get('name', ''))
-            safe_name = "".join(c for c in clip_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            # Gerar nome único para o clip
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            safe_name = "".join(c for c in clip.get('name', '') if c.isalnum() or c in (' ', '-', '_')).rstrip()
             if not safe_name:
                 safe_name = "clip"
-            output_filename = f"{safe_name}_{start_time}-{end_time}.mp4"
-            output_path = os.path.join(output_dir, output_filename)
-            logger.debug("Output path: %s", output_path)
+                
+            # Incluir o nome do vídeo original no nome do clip
+            video_basename = os.path.splitext(os.path.basename(video_path))[0]
+            output_filename = f"{safe_name}_{timestamp}_{video_basename}_{start_time}-{end_time}.mp4"
             
             # Build FFmpeg command for trimming
             command = [
@@ -400,7 +466,7 @@ def generate_clips():
                 '-t', str(end_time - start_time),  # Duration instead of end time
                 '-c', 'copy',  # Use copy codec for faster processing
                 '-y',  # Overwrite output file
-                output_path
+                os.path.join(output_dir, output_filename)
             ]
             
             logger.debug("FFmpeg command: %s", ' '.join(command))
@@ -416,14 +482,14 @@ def generate_clips():
                 logger.debug("FFmpeg stdout: %s", result.stdout)
                 logger.debug("FFmpeg stderr: %s", result.stderr)
                 
-                if not os.path.exists(output_path):
-                    raise FileNotFoundError(f"Output file was not created: {output_path}")
+                if not os.path.exists(os.path.join(output_dir, output_filename)):
+                    raise FileNotFoundError(f"Output file was not created: {os.path.join(output_dir, output_filename)}")
                 
-                file_size = os.path.getsize(output_path)
+                file_size = os.path.getsize(os.path.join(output_dir, output_filename))
                 if file_size == 0:
-                    raise ValueError(f"Generated clip is empty: {output_path}")
+                    raise ValueError(f"Generated clip is empty: {os.path.join(output_dir, output_filename)}")
                     
-                logger.debug("Clip generated successfully: %s (size: %s bytes)", output_path, file_size)
+                logger.debug("Clip generated successfully: %s (size: %s bytes)", os.path.join(output_dir, output_filename), file_size)
                 # Generate URL for the clip
                 clip_url = url_for('serve_clip', user_id=current_user.id, filename=output_filename)
                 generated_clips.append(clip_url)
