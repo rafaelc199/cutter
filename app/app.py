@@ -1,442 +1,620 @@
-from flask import Flask, request, jsonify, render_template, send_from_directory
-from typing import Dict, Any, List, Optional, Union
-import yt_dlp
-import os
-import uuid
-import time
-import re
+# Standard library imports
+import io
 import logging
+import os
 import subprocess
-from pathlib import Path
+import zipfile
+from typing import Optional, Any, cast, Dict
+
+# Third-party imports
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_file, send_from_directory
+from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
+from dotenv import load_dotenv
+import yt_dlp
+
+# Local imports
+from models import db, User
+from forms import LoginForm, RegistrationForm
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('cutter')
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Application Constants
-class Config:
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024 * 1024  # 16GB max-size
-    SEND_FILE_MAX_AGE_DEFAULT = 0
-    BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-    DOWNLOAD_DIR = BASE_DIR / "downloads"
-    CLIP_DIR = BASE_DIR / "clips"
-    ALLOWED_EXTENSIONS = {'mp4'}
-    DEFAULT_PERMISSIONS = 0o755
+# Load environment variables from .flaskenv
+load_dotenv('.flaskenv')
 
-# Initialize Flask app
 app = Flask(__name__)
-app.config.from_object(Config)
+app.static_folder = 'static'
 
-# Create necessary directories with proper permissions
-os.makedirs(Config.DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(Config.CLIP_DIR, exist_ok=True)
-os.chmod(Config.DOWNLOAD_DIR, Config.DEFAULT_PERMISSIONS)
-os.chmod(Config.CLIP_DIR, Config.DEFAULT_PERMISSIONS)
+# Flask configuration
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-123')
+app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///app.db')
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-class VideoProcessingError(Exception):
-    """Custom exception for video processing errors."""
-    pass
+# Initialize extensions
+db.init_app(app)
 
-def extract_video_id(url: str) -> Optional[str]:
-    """
-    Extract YouTube video ID from URL.
+# Create database tables
+with app.app_context():
+    db.create_all()
+
+# Configure login manager
+login_manager = LoginManager()
+login_manager.init_app(app)
+setattr(login_manager, 'login_view', 'login')  # type: ignore
+
+@login_manager.user_loader
+def load_user(user_id: str) -> Optional[UserMixin]:
+    """Load user by ID."""
+    return User.query.get(int(user_id))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Handle user login."""
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
     
-    Args:
-        url: YouTube URL
-        
-    Returns:
-        Optional[str]: Video ID if found, None otherwise
-    """
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'youtu\.be\/([0-9A-Za-z_-]{11})',
-    ]
-    for pattern in patterns:
-        if match := re.search(pattern, url):
-            return match.group(1)
-    return None
+    form = LoginForm()
+    if form.validate_on_submit():
+        user: Optional[User] = User.query.filter_by(username=form.username.data).first()
+        if user and user.check_password(form.password.data):
+            login_user(user)
+            flash('Logged in successfully.')
+            return redirect(url_for('index'))
+        flash('Invalid username or password')
+    return render_template('login.html', form=form)
 
-def download_video_ytdlp(url: str) -> Dict[str, Any]:
-    """
-    Download video using yt-dlp with optimized settings.
+@app.route('/logout')
+@login_required
+def logout():
+    """Handle user logout."""
+    logout_user()
+    return redirect(url_for('index'))
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    """Handle user registration."""
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
     
-    Args:
-        url: YouTube URL
-        
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        user = User(username=form.username.data)
+        user.set_password(form.password.data)
+        db.session.add(user)
+        db.session.commit()
+        flash('Registration successful')
+        return redirect(url_for('login'))
+    return render_template('register.html', form=form)
+
+@app.route('/')
+def index():
+    """Home page."""
+    return render_template('index.html')
+
+@app.route('/process_video', methods=['POST'])
+@login_required
+def process_video():
+    """Process uploaded YouTube video.
+    
     Returns:
-        Dict containing video information and file paths
-        
-    Raises:
-        VideoProcessingError: If download fails
+        A redirect response to either the edit page or index with appropriate flash messages.
     """
+    youtube_url = request.form.get('youtube_url', '')
+    if not youtube_url:
+        flash('Please provide a YouTube URL')
+        return redirect(url_for('index'))
+    
     try:
-        filename = f"{uuid.uuid4()}.mp4"
-        output_path = Config.DOWNLOAD_DIR / filename
+        # Setup directories
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        user_download_dir = os.path.join(base_dir, 'downloads', str(current_user.id))
+        os.makedirs(user_download_dir, exist_ok=True)
         
-        ydl_opts = {
-            'format': 'best[ext=mp4]/bestvideo[ext=mp4]+bestaudio[ext=m4a]',
-            'outtmpl': str(output_path),
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            'ignoreerrors': True,
-            'no_check_certificates': True,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
-            'socket_timeout': 30,
-            'retries': 10,
-            'fragment_retries': 10,
-            'retry_sleep': 5,
-            'merge_output_format': 'mp4',
-            'prefer_ffmpeg': True,
-            'postprocessors': [{
-                'key': 'FFmpegVideoConvertor',
-                'preferedformat': 'mp4',
-            }],
-        }
+        logger.debug("Processing video from URL: %s", youtube_url)
+        logger.debug("Download directory: %s", user_download_dir)
         
-        ydl = yt_dlp.YoutubeDL(ydl_opts)
-        info = ydl.extract_info(url, download=True)
-        
-        if not info:
-            raise VideoProcessingError("Could not extract video information")
-        
-        if not output_path.exists():
-            raise VideoProcessingError("Video file was not created")
-        
-        return {
-            "file_path": f"/downloads/{filename}",
-            "absolute_path": str(output_path),
-            "title": info.get('title', 'Unknown Title'),
-            "duration": info.get('duration', 0),
-            "channel": info.get('uploader', 'Unknown Channel')
-        }
-            
-    except Exception as e:
-        logger.error(f"Error in download_video_ytdlp: {str(e)}")
-        raise VideoProcessingError(f"Download failed: {str(e)}")
-
-def convert_time_to_seconds(time_str: str) -> float:
-    """
-    Convert time string (MM:SS or seconds) to seconds float.
-    
-    Args:
-        time_str: Time in MM:SS format or seconds
-        
-    Returns:
-        float: Time in seconds
-        
-    Raises:
-        ValueError: If time format is invalid
-    """
-    try:
-        return float(time_str)
-    except ValueError:
-        if ':' in time_str:
-            try:
-                minutes, seconds = time_str.split(':')
-                return float(minutes) * 60 + float(seconds)
-            except ValueError:
-                raise ValueError(f"Invalid time format: {time_str}. Expected MM:SS or seconds")
-        raise ValueError(f"Invalid time format: {time_str}")
-
-def sanitize_filename(name: str, index: int) -> str:
-    """
-    Sanitize and generate a unique filename.
-    
-    Args:
-        name: Original filename
-        index: Clip index
-        
-    Returns:
-        str: Sanitized and unique filename
-    """
-    if name and (sanitized := "".join(c for c in name.strip() if c.isalnum() or c in (' ', '-', '_')).strip()):
-        base_name = sanitized
-    else:
-        base_name = f"clip_{index + 1}"
-    
-    clip_name = base_name
-    counter = 1
-    while (Config.CLIP_DIR / f"{clip_name}.mp4").exists():
-        clip_name = f"{base_name}_{counter}"
-        counter += 1
-    
-    return f"{clip_name}.mp4"
-
-@app.route("/")
-def home():
-    """Render the main page."""
-    return render_template("index.html")
-
-@app.route('/downloads/<path:filename>')
-def download_file(filename: str):
-    """
-    Serve downloaded video files.
-    
-    Args:
-        filename: Name of the file to serve
-        
-    Returns:
-        Video file response or error
-    """
-    try:
-        return send_from_directory(
-            Config.DOWNLOAD_DIR, 
-            filename,
-            as_attachment=False,
-            mimetype='video/mp4'
-        )
-    except Exception as e:
-        logger.error(f"Error serving video file: {str(e)}")
-        return jsonify({"error": "File not found"}), 404
-
-@app.route('/clips/<path:filename>')
-def serve_clip(filename: str):
-    """
-    Serve processed video clips.
-    
-    Args:
-        filename: Name of the clip to serve
-        
-    Returns:
-        Video clip response or error
-    """
-    try:
-        response = send_from_directory(
-            Config.CLIP_DIR,
-            filename,
-            as_attachment=False,
-            mimetype='video/mp4',
-            conditional=True
-        )
-        response.headers.update({
-            'Accept-Ranges': 'bytes',
-            'Cache-Control': 'no-cache'
-        })
-        return response
-    except Exception as e:
-        logger.error(f"Error serving clip file: {str(e)}")
-        return jsonify({"error": "File not found"}), 404
-
-@app.route("/download", methods=["POST"])
-def download_video():
-    """
-    Handle video download requests.
-    
-    Returns:
-        JSON response with download results or error
-    """
-    try:
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
-            
-        data = request.get_json()
-        if not data or not (video_url := data.get("url")):
-            return jsonify({"error": "No video URL provided"}), 400
-
-        if not (video_id := extract_video_id(video_url)):
-            return jsonify({"error": "Invalid YouTube URL"}), 400
-
-        clean_url = f"https://www.youtube.com/watch?v={video_id}"
-        result = download_video_ytdlp(clean_url)
-        
-        return jsonify({
-            "message": "Video downloaded successfully",
-            "file_path": result["file_path"],
-            "absolute_path": result["absolute_path"],
-            "title": result["title"],
-            "duration": result["duration"],
-            "channel": result["channel"]
-        })
-
-    except VideoProcessingError as e:
-        error_msg = str(e).lower()
-        if "age-restricted" in error_msg:
-            return jsonify({"error": "This video is age-restricted"}), 403
-        elif "private" in error_msg:
-            return jsonify({"error": "This video is private"}), 403
-        elif "unavailable" in error_msg:
-            return jsonify({"error": "This video is unavailable"}), 404
-        else:
-            return jsonify({"error": f"Download failed: {str(e)}"}), 500
-    except Exception as e:
-        logger.error(f"Unexpected error in download_video: {str(e)}")
-        return jsonify({"error": "An unexpected error occurred"}), 500
-
-@app.route("/clip-multiple", methods=["POST"])
-def clip_multiple():
-    """
-    Process multiple clips from a video.
-    
-    Returns:
-        JSON response with clip information or error
-    """
-    try:
-        from moviepy.editor import VideoFileClip
-        
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
-            
-        data = request.get_json()
-        if not data or not (file_path := data.get("file_path")) or not (cuts := data.get("cuts")):
-            return jsonify({"error": "Missing required parameters"}), 400
-        
-        if file_path.startswith('/downloads/'):
-            file_path = Config.DOWNLOAD_DIR / Path(file_path).name
-        
-        if not Path(file_path).exists():
-            return jsonify({"error": "Video file not found"}), 404
-            
+        # Configure yt-dlp with error checking
         try:
-            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            return jsonify({"error": "FFmpeg not found. Please install FFmpeg"}), 500
-        
-        clips = []
-        video = None
-        
-        try:
-            video = VideoFileClip(str(file_path))
+            ydl_opts = {
+                'format': 'best',
+                'outtmpl': os.path.join(user_download_dir, '%(title)s.%(ext)s'),
+                'verbose': True,
+                'merge_output_format': 'mp4'
+            }
             
-            if not video.duration:
-                return jsonify({"error": "Invalid video file or duration"}), 400
+            # Download video
+            ydl = yt_dlp.YoutubeDL(ydl_opts)
+            logger.debug("Starting video download...")
+            info = ydl.extract_info(youtube_url, download=True)
+            if not info:
+                raise ValueError("Failed to extract video information")
+                
+            video_title = str(info.get('title', ''))
+            if not video_title:
+                raise ValueError("Failed to get video title")
             
-            for i, cut in enumerate(cuts):
-                try:
-                    start_time = convert_time_to_seconds(cut["start_time"])
-                    end_time = convert_time_to_seconds(cut["end_time"])
-                    original_name = cut.get("name", "").strip()
-                    
-                    if end_time > video.duration:
-                        return jsonify({"error": f"End time {end_time} exceeds video duration {video.duration}"}), 400
-                    if start_time < 0 or end_time <= start_time:
-                        return jsonify({"error": "Invalid time values"}), 400
-                    
-                    filename = sanitize_filename(original_name, i)
-                    clip_path = Config.CLIP_DIR / filename
-                    
-                    temp_audio = str(Config.CLIP_DIR / f"temp_audio_{uuid.uuid4()}.m4a")
-                    
-                    subclip = video.subclip(start_time, end_time)
-                    subclip.write_videofile(
-                        str(clip_path),
-                        codec='libx264',
-                        audio_codec='aac',
-                        temp_audiofile=temp_audio,
-                        remove_temp=True,
-                        logger=None
-                    )
-                    
-                    if os.path.exists(temp_audio):
-                        os.remove(temp_audio)
-                    
-                    clips.append({
-                        "clip_path": f"/clips/{filename}",
-                        "name": Path(filename).stem,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                        "duration": end_time - start_time
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Error processing clip {i}: {str(e)}")
-                    raise VideoProcessingError(f"Error processing clip {i}: {str(e)}")
-                    
+            # Ensure path uses correct separator and has extension
+            video_path = f"{current_user.id}/{video_title}.mp4"
+            video_path = video_path.replace('\\', '/')
+            
+            full_path = os.path.join(base_dir, 'downloads', str(current_user.id), f'{video_title}.mp4')
+            logger.debug("Video downloaded to: %s", full_path)
+            
+            # Verify file exists and has content
+            if not os.path.exists(full_path):
+                raise FileNotFoundError(f"Downloaded file not found: {full_path}")
+                
+            file_size = os.path.getsize(full_path)
+            if file_size == 0:
+                raise ValueError(f"Downloaded file is empty: {full_path}")
+                
+            logger.debug("File exists and size is: %s bytes", file_size)
+            
+            flash(f'Video "{video_title}" downloaded successfully!')
+            return redirect(url_for('edit_video', video_path=video_path))
+                
+        except yt_dlp.DownloadError as e:
+            raise ValueError(f"Failed to download video: {str(e)}")
+            
+    except ValueError as e:
+        logger.error("Value error in video processing: %s", str(e))
+        flash(f'Error processing video: {str(e)}')
+        return redirect(url_for('index'))
+    except FileNotFoundError as e:
+        logger.error("File error in video processing: %s", str(e))
+        flash(f'Error with video file: {str(e)}')
+        return redirect(url_for('index'))
+    except Exception as e:
+        logger.error("Unexpected error in video processing: %s", str(e), exc_info=True)
+        flash('An unexpected error occurred while processing the video')
+        return redirect(url_for('index'))
+
+@app.route('/edit/<path:video_path>')
+@login_required
+def edit_video(video_path):
+    """Video editing page."""
+    return render_template('edit_video.html', video_path=video_path)
+
+@app.route('/api/edit-video', methods=['POST'])
+@login_required
+def edit_video_api():
+    """Handle video editing API requests.
+    
+    Returns:
+        JSON response with success status and video URL or error message.
+    
+    Raises:
+        400: If request data is invalid
+        500: If video processing fails
+    """
+    try:
+        # Validate request data
+        data = cast(Dict[str, Any], request.get_json())
+        if not data:
             return jsonify({
-                "message": "Clips created successfully",
-                "clips": clips
+                'success': False,
+                'error': 'No data provided'
+            }), 400
+        
+        # Extract and validate parameters
+        try:
+            video_path = str(data['videoPath']).strip()
+            if not video_path:
+                raise ValueError("Video path cannot be empty")
+                
+            start_time = float(data['startTime'])
+            if start_time < 0:
+                raise ValueError("Start time cannot be negative")
+                
+            end_time = float(data['endTime'])
+            if end_time <= start_time:
+                raise ValueError("End time must be greater than start time")
+                
+            resolution = str(data['resolution'])
+            if resolution != 'original' and not resolution.endswith('p'):
+                raise ValueError("Invalid resolution format")
+                
+        except (KeyError, ValueError, TypeError) as e:
+            return jsonify({
+                'success': False,
+                'error': f'Invalid data: {str(e)}'
+            }), 400
+        
+        # Create output directory
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        output_dir = os.path.join('static', 'processed', str(current_user.id))
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Generate output filename
+        output_filename = f'edited_{os.path.basename(video_path)}'
+        output_path = os.path.join(output_dir, output_filename)
+        
+        # Validate input video exists
+        input_path = os.path.join(base_dir, 'downloads', video_path)
+        if not os.path.exists(input_path):
+            return jsonify({
+                'success': False,
+                'error': 'Input video file not found'
+            }), 404
+        
+        try:
+            # Build FFmpeg command
+            command = ['ffmpeg', '-i', input_path, '-ss', str(start_time), '-to', str(end_time)]
+            
+            # Add resolution parameters if not original
+            if resolution != 'original':
+                try:
+                    height = int(resolution.replace('p', ''))
+                    command.extend(['-vf', f'scale=-2:{height}'])
+                except ValueError:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Invalid resolution value'
+                    }), 400
+            
+            # Add output path and overwrite flag
+            command.extend(['-y', output_path])
+            
+            # Execute FFmpeg command
+            logger.debug("Running FFmpeg command: %s", ' '.join(command))
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            
+            # Verify output file was created
+            if not os.path.exists(output_path):
+                raise FileNotFoundError("FFmpeg failed to create output file")
+                
+            if os.path.getsize(output_path) == 0:
+                raise ValueError("FFmpeg created an empty output file")
+            
+            # Return success response
+            video_url = url_for('static', filename=f'processed/{current_user.id}/{output_filename}')
+            return jsonify({
+                'success': True,
+                'videoUrl': video_url
             })
             
-        except Exception as e:
-            logger.error(f"Error in clip_multiple: {str(e)}")
-            for clip_info in clips:
-                clip_path = Config.CLIP_DIR / Path(clip_info["clip_path"]).name
-                if clip_path.exists():
-                    clip_path.unlink()
-            raise VideoProcessingError(f"Error processing clips: {str(e)}")
+        except subprocess.CalledProcessError as e:
+            logger.error("FFmpeg error: %s", e.stderr)
+            return jsonify({
+                'success': False,
+                'error': f'FFmpeg error: {e.stderr}'
+            }), 500
             
-        finally:
-            if video:
-                video.close()
+        except (FileNotFoundError, ValueError) as e:
+            logger.error("File processing error: %s", str(e))
+            return jsonify({
+                'success': False,
+                'error': str(e)
+            }), 500
+            
+    except Exception as e:
+        logger.error("Unexpected error in edit_video_api: %s", str(e), exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred'
+        }), 500
+
+@app.route('/api/generate-clips', methods=['POST'])
+@login_required
+def generate_clips():
+    """Generate video clips based on user specifications.
+    
+    Returns:
+        JSON response with success status and generated clip URLs.
+        
+    Raises:
+        ValueError: If request data is invalid
+        FileNotFoundError: If input/output files are not found
+        RuntimeError: If FFmpeg processing fails
+    """
+    try:
+        data = cast(Dict[str, Any], request.get_json())
+        logger.debug("Received data: %s", data)
+        
+        if not data:
+            raise ValueError("No JSON data received")
+            
+        clips = cast(list[Dict[str, Any]], data.get('clips', []))
+        logger.debug("Clips data: %s", clips)
+        
+        if not clips:
+            raise ValueError("No clips data provided")
+        
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        generated_clips: list[str] = []
+        
+        for clip in clips:
+            logger.debug("Processing clip: %s", clip)
+            
+            # Validate clip data
+            required_keys = ['videoPath', 'name', 'startTime', 'endTime']
+            if not all(key in clip for key in required_keys):
+                raise ValueError(f"Missing required clip data. Required: {required_keys}. Received: {clip}")
+            
+            # Convert MM:SS to seconds for FFmpeg
+            try:
+                start_time_str = str(clip.get('startTime', ''))
+                end_time_str = str(clip.get('endTime', ''))
                 
-    except VideoProcessingError as e:
-        return jsonify({"error": str(e)}), 500
-    except Exception as e:
-        logger.error(f"Unexpected error in clip_multiple: {str(e)}")
-        return jsonify({"error": "An unexpected error occurred"}), 500
-
-@app.route("/rename-clip", methods=["POST"])
-def rename_clip():
-    """
-    Rename a processed clip.
-    
-    Returns:
-        JSON response with new clip path or error
-    """
-    try:
-        if not request.is_json:
-            return jsonify({"error": "Request must be JSON"}), 400
+                if not start_time_str or not end_time_str:
+                    raise ValueError("Start time and end time cannot be empty")
+                
+                start_minutes, start_seconds = map(int, start_time_str.split(':'))
+                end_minutes, end_seconds = map(int, end_time_str.split(':'))
+                
+                start_time = start_minutes * 60 + start_seconds
+                end_time = end_minutes * 60 + end_seconds
+                
+                if start_time < 0:
+                    raise ValueError("Start time cannot be negative")
+                if end_time <= start_time:
+                    raise ValueError("End time must be greater than start time")
+                
+                logger.debug("Converted times - Start: %ss, End: %ss", start_time, end_time)
+            except ValueError as e:
+                logger.error("Error converting time format: %s", e)
+                raise ValueError(f"Invalid time format. Expected MM:SS, got start={clip.get('startTime')}, end={clip.get('endTime')}")
             
-        data = request.get_json()
-        if not data or not (old_name := data.get("old_name")):
-            return jsonify({"error": "Missing required parameters"}), 400
+            # Get the user's download directory
+            user_download_dir = os.path.join(base_dir, 'downloads', str(current_user.id))
+            if not os.path.exists(user_download_dir):
+                raise FileNotFoundError(f"User download directory not found: {user_download_dir}")
             
-        new_name = data.get("new_name", "clip").strip()
-        if not new_name:
-            new_name = "clip"
-        
-        old_path = Config.CLIP_DIR / old_name
-        new_path = Config.CLIP_DIR / f"{new_name}.mp4"
-        
-        if not old_path.exists():
-            return jsonify({"error": "Original clip not found"}), 404
+            # Get the video filename from the directory
+            video_files = [f for f in os.listdir(user_download_dir) if f.endswith('.mp4')]
+            if not video_files:
+                raise FileNotFoundError(f"No MP4 files found in {user_download_dir}")
             
-        counter = 1
-        while new_path.exists():
-            new_path = Config.CLIP_DIR / f"{new_name}_{counter}.mp4"
-            counter += 1
+            # Use the first MP4 file found (assuming it's the one we want)
+            video_filename = video_files[0]
+            input_video_path = os.path.join(user_download_dir, video_filename)
+            
+            logger.debug("Input video path: %s", input_video_path)
+            logger.debug("Video file exists: %s", os.path.exists(input_video_path))
+            
+            # Create output directory if it doesn't exist
+            output_dir = os.path.join(base_dir, 'static', 'processed', str(current_user.id))
+            os.makedirs(output_dir, exist_ok=True)
+            logger.debug("Output directory: %s", output_dir)
+            
+            # Generate output filename
+            clip_name = str(clip.get('name', ''))
+            safe_name = "".join(c for c in clip_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            if not safe_name:
+                safe_name = "clip"
+            output_filename = f"{safe_name}_{start_time}-{end_time}.mp4"
+            output_path = os.path.join(output_dir, output_filename)
+            logger.debug("Output path: %s", output_path)
+            
+            # Build FFmpeg command for trimming
+            command = [
+                'ffmpeg',
+                '-i', input_video_path,
+                '-ss', str(start_time),
+                '-t', str(end_time - start_time),  # Duration instead of end time
+                '-c', 'copy',  # Use copy codec for faster processing
+                '-y',  # Overwrite output file
+                output_path
+            ]
+            
+            logger.debug("FFmpeg command: %s", ' '.join(command))
+            
+            try:
+                # Execute FFmpeg command
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    check=True
+                )
+                logger.debug("FFmpeg stdout: %s", result.stdout)
+                logger.debug("FFmpeg stderr: %s", result.stderr)
+                
+                if not os.path.exists(output_path):
+                    raise FileNotFoundError(f"Output file was not created: {output_path}")
+                
+                file_size = os.path.getsize(output_path)
+                if file_size == 0:
+                    raise ValueError(f"Generated clip is empty: {output_path}")
+                    
+                logger.debug("Clip generated successfully: %s (size: %s bytes)", output_path, file_size)
+                # Generate URL for the clip
+                clip_url = url_for('serve_clip', user_id=current_user.id, filename=output_filename)
+                generated_clips.append(clip_url)
+                    
+            except subprocess.CalledProcessError as e:
+                error_msg = f"FFmpeg error: {e.stderr}"
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
         
-        old_path.rename(new_path)
-        
+        if not generated_clips:
+            raise ValueError("No clips were generated")
+            
         return jsonify({
-            "message": "Clip renamed successfully",
-            "new_path": f"/clips/{new_path.name}"
+            'success': True,
+            'message': f'Generated {len(generated_clips)} clips successfully',
+            'clips': generated_clips
         })
         
+    except ValueError as e:
+        logger.error("Value error in clip generation: %s", str(e))
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 400
+    except FileNotFoundError as e:
+        logger.error("File error in clip generation: %s", str(e))
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 404
+    except RuntimeError as e:
+        logger.error("Runtime error in clip generation: %s", str(e))
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
     except Exception as e:
-        logger.error(f"Error in rename_clip: {str(e)}")
-        return jsonify({"error": f"Failed to rename clip: {str(e)}"}), 500
+        logger.error("Unexpected error in clip generation: %s", str(e), exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred while generating clips'
+        }), 500
 
-@app.route("/cleanup", methods=["POST"])
-def cleanup_files():
-    """
-    Clean up temporary files.
+@app.route('/api/download-clips', methods=['GET'])
+@login_required
+def download_clips():
+    """Download all generated clips.
     
     Returns:
-        JSON response with cleanup results
+        A file response with the zip file containing all clips or an error response.
+        
+    Raises:
+        FileNotFoundError: If clips directory or files are not found
+        IOError: If there are issues creating the zip file
     """
     try:
-        deleted_files = []
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        clips_dir = os.path.join(base_dir, 'static', 'processed', str(current_user.id))
         
-        for directory in [Config.DOWNLOAD_DIR, Config.CLIP_DIR]:
-            for filepath in directory.glob("*"):
-                if filepath.is_file():
-                    try:
-                        filepath.unlink()
-                        deleted_files.append(str(filepath))
-                    except Exception as e:
-                        logger.error(f"Error deleting {filepath}: {str(e)}")
+        # Verify clips directory exists
+        if not os.path.exists(clips_dir):
+            logger.error("Clips directory not found: %s", clips_dir)
+            return jsonify({
+                'success': False,
+                'error': 'No clips directory found'
+            }), 404
         
-        return jsonify({
-            "message": "Cleanup completed",
-            "deleted_files": deleted_files
-        })
+        # Get list of clip files
+        clip_files = [f for f in os.listdir(clips_dir) if f.endswith('.mp4')]
+        if not clip_files:
+            logger.error("No clips found in directory: %s", clips_dir)
+            return jsonify({
+                'success': False,
+                'error': 'No clips found to download'
+            }), 404
         
+        # Create a BytesIO object to store the zip file
+        memory_file = io.BytesIO()
+        
+        # Create a zip file
+        try:
+            with zipfile.ZipFile(memory_file, 'w') as zf:
+                for filename in clip_files:
+                    file_path = os.path.join(clips_dir, filename)
+                    if os.path.exists(file_path):
+                        file_size = os.path.getsize(file_path)
+                        if file_size == 0:
+                            logger.warning("Empty clip file found: %s", file_path)
+                            continue
+                            
+                        logger.debug("Adding file to zip: %s (size: %s bytes)", filename, file_size)
+                        zf.write(file_path, filename)
+                    else:
+                        logger.warning("Clip file not found: %s", file_path)
+                        
+            # Check if any files were added to the zip
+            if memory_file.tell() == 0:
+                logger.error("No valid clips were added to the zip file")
+                return jsonify({
+                    'success': False,
+                    'error': 'No valid clips to download'
+                }), 404
+                
+            # Seek to the beginning of the BytesIO object
+            memory_file.seek(0)
+            
+            logger.debug("Zip file created successfully with %d clips", len(clip_files))
+            return send_file(
+                memory_file,
+                mimetype='application/zip',
+                as_attachment=True,
+                download_name='video_clips.zip'
+            )
+            
+        except (IOError, zipfile.BadZipFile) as e:
+            logger.error("Error creating zip file: %s", str(e))
+            return jsonify({
+                'success': False,
+                'error': 'Error creating zip file'
+            }), 500
+            
     except Exception as e:
-        logger.error(f"Error in cleanup_files: {str(e)}")
-        return jsonify({"error": f"Cleanup failed: {str(e)}"}), 500
+        logger.error("Unexpected error in download_clips: %s", str(e), exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'An unexpected error occurred while downloading clips'
+        }), 500
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000) 
+@app.route('/downloads/<path:filename>')
+@login_required
+def serve_video(filename: str):
+    """Serve downloaded video files.
+    
+    Args:
+        filename: The name of the video file to serve.
+        
+    Returns:
+        The video file response or an error message.
+    """
+    try:
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        file_path = os.path.join(base_dir, 'downloads', filename)
+        
+        logger.debug("Request to serve video: %s", filename)
+        logger.debug("Base directory: %s", base_dir)
+        logger.debug("Full video path: %s", file_path)
+        
+        if not os.path.exists(file_path):
+            logger.error("File not found: %s", file_path)
+            return "File not found", 404
+            
+        logger.debug("File exists: %s", file_path)
+        logger.debug("File size: %s bytes", os.path.getsize(file_path))
+        
+        return send_from_directory(os.path.dirname(file_path), os.path.basename(file_path))
+    except Exception as e:
+        error_msg = str(e)
+        logger.error("Error serving video: %s", error_msg)
+        return error_msg, 500
+
+@app.route('/clip/<int:user_id>/<path:filename>')
+@login_required
+def serve_clip(user_id: int, filename: str):
+    """Serve a processed clip.
+    
+    Args:
+        user_id: The ID of the user requesting the clip.
+        filename: The name of the clip file to serve.
+        
+    Returns:
+        The clip file response or an error message.
+    """
+    if user_id != current_user.id:
+        return "Unauthorized", 403
+        
+    try:
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        clips_dir = os.path.join(base_dir, 'static', 'processed', str(user_id))
+        
+        if not os.path.exists(clips_dir):
+            raise FileNotFoundError(f"Clips directory not found: {clips_dir}")
+            
+        file_path = os.path.join(clips_dir, filename)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Clip file not found: {file_path}")
+            
+        return send_from_directory(clips_dir, filename)
+    except Exception as e:
+        error_msg = str(e)
+        logger.error("Error serving clip: %s", error_msg)
+        return error_msg, 500
+
+if __name__ == '__main__':
+    app.run(debug=os.environ.get('FLASK_DEBUG', '0') == '1') 
